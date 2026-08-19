@@ -790,6 +790,67 @@ def _check_read_preconditions(headers: dict, obj: dict, resp_headers: dict):
     return None
 
 
+def _delete_condition_target(bucket: dict, bucket_name: str, key: str,
+                             version_id: str) -> dict | None:
+    """The object record a delete's conditions are evaluated against.
+
+    Without a version id that is the current object; with one it is the
+    version addressed, since that is what the delete would remove.  A delete
+    marker, or a version that is not there, reads as nothing to condition on.
+    """
+    if not version_id:
+        return bucket["objects"].get(key)
+    for v in _object_versions.get((bucket_name, key), []):
+        if v["version_id"] == version_id:
+            if v.get("is_delete_marker"):
+                return None
+            return _object_record_from_version(v)
+    current = bucket["objects"].get(key)
+    if version_id == "null" and current is not None and not current.get(
+            "version_id"):
+        return current
+    return None
+
+
+def _delete_conditions_hold(obj: dict | None, size: str | None,
+                            last_modified: str | None) -> bool:
+    """Whether a delete's size and last-modified-time conditions hold.
+
+    These ride alongside If-Match on a conditional delete and narrow it the
+    same way: the object goes only if it is still the one the caller last
+    read.  A key that is not there holds every condition, since deleting one
+    that is already gone is a success whatever the request asked for.
+
+    A malformed value never holds -- treating an unparseable size as "no
+    condition" would delete the object the caller was trying to protect.
+    """
+    if obj is None:
+        return True
+
+    if size is not None and size != "":
+        try:
+            if int(size) != int(obj.get("size") or 0):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    if last_modified is not None and last_modified != "":
+        wanted = _parse_http_date(last_modified)
+        if wanted is None:
+            try:
+                wanted = _dt.datetime.fromisoformat(
+                    last_modified.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+            if wanted.tzinfo is None:
+                wanted = wanted.replace(tzinfo=_dt.timezone.utc)
+        # Last-Modified is second-precise, so compare at that resolution.
+        if wanted.replace(microsecond=0) != _object_mtime_dt(obj):
+            return False
+
+    return True
+
+
 def _find_xml_tag(parent, tag_name, ns=S3_NS):
     el = parent.find("{%s}%s" % (ns, tag_name))
     if el is None:
@@ -3794,16 +3855,23 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    # Conditional delete: If-Match against the current object's ETag. An
-    # object whose ETag differs fails the precondition with 412 and stays —
+    # Conditional delete: If-Match against the ETag, and the size and
+    # last-modified-time conditions that ride alongside it.  An object that
+    # differs on any of them fails the precondition with 412 and stays —
     # S3's compare-and-swap delete.  A key that is not there at all is not a
     # failed precondition: deleting one is a success either way, and S3
     # answers the conditional delete of an absent key 204 like any other.
     if_match = (headers.get("if-match") or "").strip()
-    if if_match:
-        _cur = bucket["objects"].get(key)
-        if _cur is not None and if_match != "*" and (
-                if_match.strip('"') != _cur["etag"].strip('"')):
+    if_match_size = (headers.get("x-amz-if-match-size") or "").strip()
+    if_match_mtime = (
+        headers.get("x-amz-if-match-last-modified-time") or "").strip()
+    if if_match or if_match_size or if_match_mtime:
+        _cur = _delete_condition_target(
+            bucket, bucket_name, key, _qp(query_params, "versionId", ""))
+        etag_holds = (not if_match or if_match == "*" or _cur is None
+                      or if_match.strip('"') == _cur["etag"].strip('"'))
+        if not etag_holds or not _delete_conditions_hold(
+                _cur, if_match_size, if_match_mtime):
             return _error(
                 "PreconditionFailed",
                 "At least one of the preconditions you specified did not hold.",
@@ -5016,9 +5084,18 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
         # (PreconditionFailed), not Deleted, so the object survives.
         etag_el = _find_xml_tag(obj_el, "ETag")
         cond_etag = etag_el.text if (etag_el is not None and etag_el.text) else ""
-        if cond_etag:
-            _cur = bucket["objects"].get(k)
-            if _cur is None or cond_etag.strip('"') != _cur["etag"].strip('"'):
+        size_el = _find_xml_tag(obj_el, "Size")
+        cond_size = size_el.text if (size_el is not None and size_el.text) else ""
+        mtime_el = _find_xml_tag(obj_el, "LastModifiedTime")
+        cond_mtime = (
+            mtime_el.text if (mtime_el is not None and mtime_el.text) else "")
+        if cond_etag or cond_size or cond_mtime:
+            _cur = _delete_condition_target(bucket, bucket_name, k, version_id)
+            etag_holds = not cond_etag or (
+                _cur is not None
+                and cond_etag.strip('"') == _cur["etag"].strip('"'))
+            if not etag_holds or not _delete_conditions_hold(
+                    _cur, cond_size, cond_mtime):
                 errors.append({
                     "key": k,
                     "version_id": version_id,

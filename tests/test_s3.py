@@ -5057,6 +5057,68 @@ def test_s3_conditional_delete_of_absent_key_succeeds(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def test_s3_conditional_delete_size_and_last_modified(s3):
+    """Size and LastModifiedTime narrow a delete the way an ETag does: the
+    object goes only if it is still the one the caller last read.  They ride
+    as headers on DeleteObject and as ObjectIdentifier fields in a batch, and
+    a version id points them at that version rather than the current one."""
+    import datetime
+
+    bucket = "intg-s3-conditional-delete-size"
+    s3.create_bucket(Bucket=bucket)
+    stale = datetime.datetime(2015, 1, 1)
+
+    s3.put_object(Bucket=bucket, Key="single", Body=b"1234")
+    mtime = s3.head_object(Bucket=bucket, Key="single")["LastModified"]
+    for condition in ({"IfMatchSize": 9999}, {"IfMatchLastModifiedTime": stale}):
+        with pytest.raises(ClientError) as exc:
+            s3.delete_object(Bucket=bucket, Key="single", **condition)
+        assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+    assert s3.get_object(Bucket=bucket, Key="single")["Body"].read() == b"1234"
+    s3.delete_object(Bucket=bucket, Key="single", IfMatchSize=4,
+                     IfMatchLastModifiedTime=mtime)
+
+    s3.put_object(Bucket=bucket, Key="batch", Body=b"1234")
+    resp = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": [{"Key": "batch", "Size": 9999}]})
+    assert resp["Errors"][0]["Code"] == "PreconditionFailed"
+    resp = s3.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": "batch", "LastModifiedTime": stale}]})
+    assert resp["Errors"][0]["Code"] == "PreconditionFailed"
+    resp = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": [{"Key": "batch", "Size": 4}]})
+    assert resp["Deleted"][0]["Key"] == "batch"
+
+    # A key already gone holds every condition, as with If-Match.
+    resp = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": [{"Key": "batch", "Size": 9999}]})
+    assert not resp.get("Errors")
+
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_conditional_delete_size_reads_the_named_version(s3):
+    """A batch delete naming a version conditions on that version's size, not
+    on whatever the current object happens to be."""
+    bucket = "intg-s3-conditional-delete-version-size"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket,
+                             VersioningConfiguration={"Status": "Enabled"})
+    first = s3.put_object(Bucket=bucket, Key="k", Body=b"1234")["VersionId"]
+    s3.put_object(Bucket=bucket, Key="k", Body=b"1234567890")
+
+    # The current version is 10 bytes; the condition names the 4-byte one.
+    resp = s3.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": "k", "VersionId": first, "Size": 10}]})
+    assert resp["Errors"][0]["Code"] == "PreconditionFailed"
+    resp = s3.delete_objects(
+        Bucket=bucket,
+        Delete={"Objects": [{"Key": "k", "VersionId": first, "Size": 4}]})
+    assert resp["Deleted"][0]["Key"] == "k"
+
+
 def test_s3_copy_object_specific_version(s3):
     """CopyObject with a source ?versionId copies that exact version, not the
     current object. Regression for #1328."""
