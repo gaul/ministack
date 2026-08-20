@@ -3802,8 +3802,20 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     if_match = (headers.get("if-match") or "").strip()
     if if_match:
         _cur = bucket["objects"].get(key)
-        if _cur is not None and if_match != "*" and (
-                if_match.strip('"') != _cur["etag"].strip('"')):
+        if _cur is not None:
+            _holds = if_match == "*" or (
+                if_match.strip('"') == _cur["etag"].strip('"'))
+        else:
+            # No current object.  A key that holds nothing but delete markers
+            # -- including the marker a delete of an absent key leaves behind
+            # in a versioned bucket -- reads as gone, and any condition holds
+            # against it.  A key whose history still carries a real version
+            # is not gone, so a named ETag fails there; If-Match: * asks only
+            # that the key be addressable and holds either way.
+            _holds = if_match == "*" or not any(
+                not v.get("is_delete_marker")
+                for v in _object_versions.get((bucket_name, key)) or [])
+        if not _holds:
             return _error(
                 "PreconditionFailed",
                 "At least one of the preconditions you specified did not hold.",

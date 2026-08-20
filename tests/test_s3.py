@@ -5057,6 +5057,42 @@ def test_s3_conditional_delete_of_absent_key_succeeds(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def test_s3_conditional_delete_over_a_delete_marker(s3):
+    """A key whose current version is a delete marker still has something to
+    compare against: S3 fails a named ETag with 412 there, where it lets the
+    same condition through on a key that was never written.  If-Match: * asks
+    only that the key be addressable, so it holds either way."""
+    bucket = "intg-s3-conditional-delete-marker"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+
+    # Nothing written yet: every condition is a success.
+    for condition in ("*", "badetag"):
+        resp = s3.delete_object(Bucket=bucket, Key="obj", IfMatch=condition)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+    etag = s3.put_object(Bucket=bucket, Key="obj", Body=b"x")["ETag"]
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="obj", IfMatch="badetag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    resp = s3.delete_object(Bucket=bucket, Key="obj", IfMatch=etag)
+    assert resp["DeleteMarker"]
+
+    resp = s3.delete_object(Bucket=bucket, Key="obj", IfMatch="*")
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 204
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="obj", IfMatch="badetag")
+    assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+
+    for version in s3.list_object_versions(Bucket=bucket).get("Versions", []):
+        s3.delete_object(Bucket=bucket, Key="obj", VersionId=version["VersionId"])
+    for marker in s3.list_object_versions(Bucket=bucket).get("DeleteMarkers", []):
+        s3.delete_object(Bucket=bucket, Key="obj", VersionId=marker["VersionId"])
+    s3.delete_bucket(Bucket=bucket)
+
+
 def test_s3_copy_object_specific_version(s3):
     """CopyObject with a source ?versionId copies that exact version, not the
     current object. Regression for #1328."""
