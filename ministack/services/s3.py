@@ -3794,15 +3794,27 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None,
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    # Conditional delete: If-Match against the current object's ETag. An
-    # object whose ETag differs fails the precondition with 412 and stays —
-    # S3's compare-and-swap delete.  A key that is not there at all is not a
-    # failed precondition: deleting one is a success either way, and S3
-    # answers the conditional delete of an absent key 204 like any other.
+    # Conditional delete: If-Match against the current object's ETag, S3's
+    # compare-and-swap delete.  An object whose ETag differs fails the
+    # precondition with 412 and stays.
+    #
+    # The condition is evaluated against the current version and nothing
+    # else, so a key with no current object -- never written, or one whose
+    # current version is a delete marker -- has nothing to compare and the
+    # request is answered 404 rather than treated as an already-done delete.
+    # A delete marker reads as absent even where a real version survives
+    # underneath it: S3 does not look past the marker.
     if_match = (headers.get("if-match") or "").strip()
     if if_match:
         _cur = bucket["objects"].get(key)
-        if _cur is not None and if_match != "*" and (
+        if _cur is None:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        if if_match != "*" and (
                 if_match.strip('"') != _cur["etag"].strip('"')):
             return _error(
                 "PreconditionFailed",
