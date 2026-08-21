@@ -30,13 +30,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint-url")
     parser.add_argument("--region", default="eu-west-1")
+    parser.add_argument("--bucket-prefix", default="ministack-cond-delete")
     args = parser.parse_args()
 
     s3 = boto3.client("s3", endpoint_url=args.endpoint_url,
                       region_name=args.region)
     suffix = uuid.uuid4().hex[:12]
-    plain = f"cond-delete-plain-{suffix}"
-    versioned = f"cond-delete-versioned-{suffix}"
+    plain = f"{args.bucket_prefix}-plain-{suffix}"
+    versioned = f"{args.bucket_prefix}-versioned-{suffix}"
     created = []
     rows = []
 
