@@ -4226,6 +4226,44 @@ def _object_mtime_dt(obj: dict):
     return dt.replace(microsecond=0)
 
 
+def _check_copy_source_preconditions(headers: dict, src_obj: dict):
+    """Judge the x-amz-copy-source-if-* headers against the source.
+
+    Per the AWS CopyObject reference (RFC 7232 precedence):
+    x-amz-copy-source-if-match takes precedence over -if-unmodified-since,
+    and -if-none-match over -if-modified-since, so the date header only
+    applies when its ETag counterpart is absent.  UploadPartCopy carries the
+    same four headers and judges them the same way, so both ask here.
+
+    Returns an error response, or None when every condition holds."""
+    msg = "At least one of the pre-conditions you specified did not hold"
+    src_mtime = _object_mtime_dt(src_obj)
+    src_etag = (src_obj.get("etag") or "").strip('"')
+
+    if_match = headers.get("x-amz-copy-source-if-match", "")
+    if if_match:
+        if if_match.strip('"') != src_etag:
+            return _error("PreconditionFailed", msg, 412)
+    else:
+        unmod = _parse_http_date(
+            headers.get("x-amz-copy-source-if-unmodified-since", ""))
+        # "Unmodified since" fails when the source was modified after it.
+        if unmod and src_mtime and src_mtime > unmod:
+            return _error("PreconditionFailed", msg, 412)
+
+    if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
+    if if_none_match:
+        if if_none_match.strip('"') == src_etag:
+            return _error("PreconditionFailed", msg, 412)
+    else:
+        mod = _parse_http_date(
+            headers.get("x-amz-copy-source-if-modified-since", ""))
+        # "Modified since" fails when the source has NOT changed since it.
+        if mod and src_mtime and src_mtime <= mod:
+            return _error("PreconditionFailed", msg, 412)
+    return None
+
+
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # Split the raw header at "?" before percent-decoding: a key legitimately
     # containing "?versionId" arrives encoded (%3FversionId) and must stay
@@ -4257,6 +4295,13 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
+
+    # A canned ACL on the copy applies to the destination, as it does on a
+    # put; an unknown value rejects the whole request rather than being
+    # dropped on the floor.
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
     if src_version_id:
         ventry = next(
@@ -4304,32 +4349,9 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # AWS echoes the copied source version on a versioned source.
     copy_src_vid = src_version_id or src_obj.get("version_id")
 
-    # Copy-source preconditions. Per the AWS CopyObject reference (RFC 7232
-    # precedence): x-amz-copy-source-if-match takes precedence over
-    # -if-unmodified-since, and -if-none-match over -if-modified-since, so the
-    # date header only applies when its ETag counterpart is absent.
-    _precond_msg = "At least one of the pre-conditions you specified did not hold"
-    src_mtime = _object_mtime_dt(src_obj)
-
-    if_match = headers.get("x-amz-copy-source-if-match", "")
-    if if_match:
-        if if_match.strip('"') != src_obj["etag"].strip('"'):
-            return _error("PreconditionFailed", _precond_msg, 412)
-    else:
-        unmod = _parse_http_date(headers.get("x-amz-copy-source-if-unmodified-since", ""))
-        # "Unmodified since" fails when the source was modified after the given time.
-        if unmod and src_mtime and src_mtime > unmod:
-            return _error("PreconditionFailed", _precond_msg, 412)
-
-    if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
-    if if_none_match:
-        if if_none_match.strip('"') == src_obj["etag"].strip('"'):
-            return _error("PreconditionFailed", _precond_msg, 412)
-    else:
-        mod = _parse_http_date(headers.get("x-amz-copy-source-if-modified-since", ""))
-        # "Modified since" fails when the source has NOT changed since the given time.
-        if mod and src_mtime and src_mtime <= mod:
-            return _error("PreconditionFailed", _precond_msg, 412)
+    precond_err = _check_copy_source_preconditions(headers, src_obj)
+    if precond_err is not None:
+        return precond_err
 
     directive = headers.get("x-amz-metadata-directive", "COPY").upper()
     if directive == "REPLACE":
@@ -4454,6 +4476,14 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
     else:
         _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
+
+    if canned_acl:
+        _object_acl[(bucket_name, dest_key, dest_version_id)] = (
+            _canned_acl_policy_xml(canned_acl, _canonical_owner_id()))
+    else:
+        # The destination is a new object: it does not inherit whatever the
+        # key it replaced was permissioned with.
+        _object_acl.pop((bucket_name, dest_key, dest_version_id), None)
 
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
@@ -5592,6 +5622,10 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     sse_src_err = _check_sse_c_copy_source(headers, ventry)
     if sse_src_err is not None:
         return sse_src_err
+
+    precond_err = _check_copy_source_preconditions(headers, ventry)
+    if precond_err is not None:
+        return precond_err
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")

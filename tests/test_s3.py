@@ -5644,3 +5644,59 @@ def test_s3_restore_notifications_to_sqs(s3, sqs):
     red = completed["glacierEventData"]["restoreEventData"]
     assert red["lifecycleRestoreStorageClass"] == "DEEP_ARCHIVE"
     assert red["lifecycleRestorationExpiryTime"].endswith("Z")
+
+
+def test_s3_copy_object_applies_canned_acl(s3):
+    """x-amz-acl on a copy permissions the destination, as it does on a put."""
+    bkt = "s3-copy-acl"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src.txt", Body=b"body")
+
+    s3.copy_object(Bucket=bkt, Key="dst.txt", ACL="public-read",
+                   CopySource={"Bucket": bkt, "Key": "src.txt"})
+    grants = s3.get_object_acl(Bucket=bkt, Key="dst.txt")["Grants"]
+    assert any(g.get("Grantee", {}).get("URI", "").endswith("AllUsers")
+               for g in grants)
+
+    # A copy without one leaves the destination private.
+    s3.copy_object(Bucket=bkt, Key="plain.txt",
+                   CopySource={"Bucket": bkt, "Key": "src.txt"})
+    grants = s3.get_object_acl(Bucket=bkt, Key="plain.txt")["Grants"]
+    assert not any(g.get("Grantee", {}).get("URI", "").endswith("AllUsers")
+                   for g in grants)
+
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bkt, Key="bad.txt", ACL="nonsense",
+                       CopySource={"Bucket": bkt, "Key": "src.txt"})
+    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_upload_part_copy_honours_source_preconditions(s3):
+    """UploadPartCopy carries the same copy-source conditions CopyObject does."""
+    bkt = "s3-upc-precond"
+    s3.create_bucket(Bucket=bkt)
+    body = b"x" * (5 * 1024 * 1024)
+    etag = s3.put_object(Bucket=bkt, Key="src.bin", Body=body)["ETag"]
+
+    upload = s3.create_multipart_upload(Bucket=bkt, Key="dst.bin")["UploadId"]
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bkt, Key="dst.bin", UploadId=upload,
+                            PartNumber=1,
+                            CopySource={"Bucket": bkt, "Key": "src.bin"},
+                            CopySourceIfMatch='"00000000000000000000000000000000"')
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    with pytest.raises(ClientError) as exc:
+        s3.upload_part_copy(Bucket=bkt, Key="dst.bin", UploadId=upload,
+                            PartNumber=1,
+                            CopySource={"Bucket": bkt, "Key": "src.bin"},
+                            CopySourceIfNoneMatch=etag)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    # The condition that holds copies the range.
+    part = s3.upload_part_copy(Bucket=bkt, Key="dst.bin", UploadId=upload,
+                               PartNumber=1,
+                               CopySource={"Bucket": bkt, "Key": "src.bin"},
+                               CopySourceIfMatch=etag)
+    assert part["CopyPartResult"]["ETag"]
+    s3.abort_multipart_upload(Bucket=bkt, Key="dst.bin", UploadId=upload)
