@@ -1860,11 +1860,21 @@ def _create_bucket(name: str, body: bytes, headers: dict = None):
     return 200, {"Location": f"/{name}"}, b""
 
 
+def _bucket_has_versions(name: str) -> bool:
+    """Whether any version or delete marker remains under `name`.
+
+    A versioned bucket whose current objects are all shadowed by delete
+    markers still holds every one of those versions, and AWS refuses to
+    delete it until they are removed by version id."""
+    return any(bn == name and versions
+               for (bn, _), versions in _object_versions.items())
+
+
 def _delete_bucket(name: str):
     bucket = _ensure_bucket(name)
     if bucket is None:
         return _no_such_bucket(name)
-    if bucket["objects"]:
+    if bucket["objects"] or _bucket_has_versions(name):
         return _error(
             "BucketNotEmpty",
             "The bucket you tried to delete is not empty",
@@ -2574,6 +2584,7 @@ def _list_object_versions(bucket_name: str, query_params: dict):
         return _no_such_bucket(bucket_name)
 
     prefix = _qp(query_params, "prefix", "")
+    delimiter = _qp(query_params, "delimiter", "")
     key_marker = _qp(query_params, "key-marker", "")
     version_id_marker = _qp(query_params, "version-id-marker", "")
     max_keys = int(_qp(query_params, "max-keys", "1000"))
@@ -2581,6 +2592,8 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     root = Element("ListVersionsResult", xmlns=S3_NS)
     SubElement(root, "Name").text = bucket_name
     SubElement(root, "Prefix").text = prefix
+    if delimiter:
+        SubElement(root, "Delimiter").text = delimiter
     SubElement(root, "KeyMarker").text = key_marker
     SubElement(root, "VersionIdMarker").text = version_id_marker
     SubElement(root, "MaxKeys").text = str(max_keys)
@@ -2635,6 +2648,33 @@ def _list_object_versions(bucket_name: str, query_params: dict):
             owner = SubElement(ver, "Owner")
         SubElement(owner, "ID").text = owner_id
         SubElement(owner, "DisplayName").text = "ministack"
+
+    # A delimiter rolls every key that carries one after the prefix up into a
+    # CommonPrefixes entry, and none of that key's versions is listed --
+    # ListObjectVersions groups exactly as ListObjects does.  Each distinct
+    # prefix counts once against MaxKeys.
+    common_prefixes = []
+    if delimiter:
+        rolled = []
+        for k in keys:
+            tail = k[len(prefix):]
+            cut = tail.find(delimiter)
+            if cut == -1:
+                rolled.append(k)
+                continue
+            group = prefix + tail[:cut + len(delimiter)]
+            if group not in common_prefixes:
+                common_prefixes.append(group)
+        keys = rolled
+
+    for group in common_prefixes:
+        if count >= max_keys:
+            is_truncated = True
+            break
+        cp = SubElement(root, "CommonPrefixes")
+        SubElement(cp, "Prefix").text = group
+        next_key_marker, next_version_id_marker = group, None
+        count += 1
 
     for k in keys:
         if count >= max_keys:
@@ -3593,6 +3633,8 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         versions = _object_versions.get(vkey, [])
         for v in versions:
             if v["version_id"] == version_id:
+                if v.get("is_delete_marker"):
+                    return _delete_marker_read_refused(v)
                 # Route through the shared header builder (same path as versioned
                 # HeadObject) so a version's user metadata (x-amz-meta-*),
                 # preserved headers and content-encoding are emitted — not just
@@ -3850,13 +3892,15 @@ def _head_object(bucket_name: str, key: str, headers: dict | None = None,
              if v["version_id"] == version_id),
             None,
         )
-        if ventry is None or ventry.get("is_delete_marker"):
+        if ventry is None:
             return _error(
                 "NoSuchVersion",
                 "The specified version does not exist.",
                 404,
                 f"/{bucket_name}/{key}",
             )
+        if ventry.get("is_delete_marker"):
+            return _delete_marker_read_refused(ventry)
         obj = _object_record_from_version(ventry)
     else:
         if key not in bucket["objects"]:
@@ -4013,6 +4057,25 @@ def _record_delete_marker(bucket_name: str, key: str,
         "is_delete_marker": True,
     })
     return marker_id
+
+
+def _delete_marker_read_refused(version: dict) -> tuple:
+    """The refusal a read of a delete marker draws.
+
+    A marker has no content to return, and AWS says so with 405 rather than
+    a 404: the version is there, it just cannot be read.  The marker's id
+    and the delete-marker flag ride on the response, and Allow names the
+    one method that does work on it."""
+    status, headers, body = _error(
+        "MethodNotAllowed",
+        "The specified method is not allowed against this resource.",
+        405,
+    )
+    headers = dict(headers)
+    headers["x-amz-delete-marker"] = "true"
+    headers["x-amz-version-id"] = version["version_id"]
+    headers["Allow"] = "DELETE"
+    return status, headers, body
 
 
 def _delete_marker_404_headers(bucket_name: str, key: str) -> dict:
@@ -4480,6 +4543,30 @@ def _resolve_subresource_version(query_params: dict, bucket: dict, key: str):
     return obj.get("version_id") if obj else None
 
 
+def _no_such_version(bucket_name: str, key: str, query_params: dict,
+                     ) -> tuple | None:
+    """Refuse a subresource op whose ?versionId= names nothing.
+
+    The id addresses a version the way a key addresses an object, so one
+    that was never minted -- or has since been deleted -- draws
+    NoSuchVersion rather than the default policy for a version that is not
+    there.  The literal "null" is exempt: it names the pre-versioning
+    object, which the index only carries once a versioned write lands on
+    top of it."""
+    vid = _qp(query_params or {}, "versionId", "")
+    if not vid or vid == "null":
+        return None
+    if any(v["version_id"] == vid
+           for v in _object_versions.get((bucket_name, key), [])):
+        return None
+    return _error(
+        "NoSuchVersion",
+        "The specified version does not exist.",
+        404,
+        f"/{bucket_name}/{key}",
+    )
+
+
 def _get_object_tagging(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -4492,6 +4579,9 @@ def _get_object_tagging(bucket_name: str, key: str, query_params: dict | None = 
             f"/{bucket_name}/{key}",
         )
 
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     tags = _object_tags.get((bucket_name, key, version_id), {})
     root = Element("Tagging", xmlns=S3_NS)
@@ -4525,6 +4615,9 @@ def _put_object_tagging(
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
     if len(tags) > 10:
         return _error("BadRequest", "Object tags cannot be greater than 10", 400)
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags[(bucket_name, key, version_id)] = tags
     resp_headers = {"Content-Type": "application/xml"}
@@ -4546,6 +4639,9 @@ def _delete_object_tagging(
             404,
             f"/{bucket_name}/{key}",
         )
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     _object_tags.pop((bucket_name, key, version_id), None)
     resp_headers = {}
@@ -4914,6 +5010,9 @@ def _get_object_acl(bucket_name: str, key: str, query_params: dict | None = None
 
     # ACLs are per-version, like tags: a `?versionId=` reads that version's
     # ACL, and a version that never had one set reads as the default policy.
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
     stored = _object_acl.get((bucket_name, key, version_id))
     body = stored.encode("utf-8") if stored else _default_object_acl_xml()
@@ -4938,6 +5037,9 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict,
 
     # A `?versionId=` sets that specific version's ACL; without it the current
     # version's. Later versions are separate objects and keep their defaults.
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
