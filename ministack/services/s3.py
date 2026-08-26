@@ -1213,12 +1213,13 @@ def _resolve_object_checksums(body: bytes, headers: dict):
     """Build the stored checksum dict and validate any client-supplied values.
 
     AWS PutObject contract:
-      - `x-amz-checksum-{alg}` headers carry a client-computed value.
+      - `x-amz-checksum-{alg}` headers carry a client-computed value, which
+        the server recomputes from the body and MUST reject with `BadDigest`
+        (HTTP 400) when the two disagree.  A value that is never checked is
+        worse than none: it round-trips on Get as though the body had been
+        verified.
       - `x-amz-sdk-checksum-algorithm: ALG` asks the server to compute that
         algorithm; the resulting value is returned alongside the response.
-      - When the SDK both names an algorithm AND supplies its value, the
-        server-computed value MUST match the supplied one or the request is
-        rejected with `BadDigest` (HTTP 400).
 
     Ministack-specific: CRC32C requires an optional native library that the
     "no new dependencies" rule forbids us from adding. Rather than silently
@@ -1257,18 +1258,24 @@ def _resolve_object_checksums(body: bytes, headers: dict):
             400,
         )
 
+    # Every supplied value is verified against the body, whether or not the
+    # request also names an algorithm for the server to compute: the client
+    # asked for the object to be checked, and an unverified value would be
+    # stored and echoed as if it had been.
     checksums = dict(provided)
+    for alg, supplied in provided.items():
+        computed = _compute_s3_checksum(alg, body)
+        if computed is not None and supplied != computed:
+            return {}, _error(
+                "BadDigest",
+                f"The {alg} you specified did not match the calculated checksum.",
+                400,
+            )
+
     if sdk_alg_raw:
         sdk_key = sdk_alg_raw.upper().replace("_", "")
         computed = _compute_s3_checksum(sdk_alg_raw, body)
         if computed is not None:
-            existing = provided.get(sdk_key)
-            if existing and existing != computed:
-                return {}, _error(
-                    "BadDigest",
-                    f"The {sdk_key} you specified did not match the calculated checksum.",
-                    400,
-                )
             checksums[sdk_key] = computed
     return checksums, None
 
@@ -1543,6 +1550,54 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     return None
 
 
+# SigV4 / SigV2 presign machinery: query parameters that are part of the
+# signature itself, never a hoisted request header.
+_PRESIGN_SIGNING_PARAMS = {
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-content-sha256",
+}
+
+
+def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
+    """Fold a presigned URL's hoisted ``x-amz-*`` query params into headers.
+
+    A presigned URL is handed to a caller who sends nothing but the URL and a
+    body, so the ``x-amz-*`` headers the operation asked for — user metadata
+    (``x-amz-meta-*``), ACL, storage class, tagging, SSE, copy source — cannot
+    travel as headers. SigV4 allows them to be *hoisted* into the query string
+    instead, where the signature covers them exactly as a signed header would,
+    and several SDKs presign that way (some hoist every ``x-amz-`` header, some
+    only what the operation set). Real S3 applies those params as the headers
+    they stand for.
+
+    MiniStack only ever looked at headers, so a presigned upload carrying
+    metadata in its query string stored the object without any: the PUT
+    succeeded and the metadata was silently dropped.
+
+    An explicitly sent header always wins over its hoisted twin.
+    """
+    hoisted = None
+    for name, values in query_params.items():
+        lname = name.lower()
+        if not lname.startswith("x-amz-") or lname in _PRESIGN_SIGNING_PARAMS:
+            continue
+        if lname in headers:
+            continue
+        value = values[0] if isinstance(values, list) else values
+        if value is None:
+            continue
+        if hoisted is None:
+            hoisted = dict(headers)
+        hoisted[lname] = value
+    return hoisted if hoisted is not None else headers
+
+
 async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict,
     signed_path: str | None = None,
@@ -1561,6 +1616,11 @@ async def handle_request(
         resp_headers.setdefault("x-amz-request-id", new_uuid())
         resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
         return status, resp_headers, resp_body
+
+    # A presigned URL may carry its `x-amz-*` headers in the query string; fold
+    # them back in before routing so metadata, ACL, storage class and friends
+    # reach the handlers exactly as a header-signed request delivers them.
+    headers = _merge_hoisted_amz_headers(headers, query_params)
 
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
