@@ -3100,6 +3100,58 @@ def test_ebs_create_and_describe_snapshot(ec2):
     assert desc["Snapshots"][0]["VolumeId"] == vol_id
     assert desc["Snapshots"][0]["Description"] == "test snapshot"
 
+def test_ebs_describe_snapshots_honors_filters(ec2):
+    """Filters must narrow the result. Ignoring them returns every snapshot in the account, so a
+    tag scan looking for "the snapshot of this backup" adopts one taken by something else."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    key = f"check-{tag}"          # unique, so other tests' snapshots cannot match the tag filters
+    first_vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=11, VolumeType="gp2")["VolumeId"]
+    second_vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=12, VolumeType="gp2")["VolumeId"]
+    tagged = ec2.create_snapshot(
+        VolumeId=first_vol, Description=f"tagged {tag}",
+        TagSpecifications=[{"ResourceType": "snapshot", "Tags": [{"Key": key, "Value": tag}]}],
+    )["SnapshotId"]
+    # A second snapshot of the same volume, untagged: with the filters ignored it comes back too.
+    spare = ec2.create_snapshot(VolumeId=first_vol, Description=f"spare {tag}")["SnapshotId"]
+    other_volume = ec2.create_snapshot(VolumeId=second_vol, Description=f"other {tag}")["SnapshotId"]
+
+    def ids(**kwargs):
+        return sorted(s["SnapshotId"] for s in ec2.describe_snapshots(**kwargs)["Snapshots"])
+
+    try:
+        assert ids(Filters=[{"Name": f"tag:{key}", "Values": [tag]}]) == [tagged]
+        assert ids(Filters=[{"Name": "tag-key", "Values": [key]}]) == [tagged]
+        assert ids(Filters=[{"Name": "volume-id", "Values": [second_vol]}]) == [other_volume]
+        assert ids(Filters=[{"Name": "description", "Values": [f"spare {tag}"]}]) == [spare]
+        assert ids(Filters=[{"Name": "volume-size", "Values": ["12"]}]) == [other_volume]
+        assert ids(Filters=[{"Name": "snapshot-id", "Values": [spare]}]) == [spare]
+        # Other tests leave completed snapshots behind, so this one asserts on membership.
+        completed = ids(Filters=[{"Name": "status", "Values": ["completed"]}])
+        assert tagged in completed and spare in completed
+        # Two filter names is an AND, two values for one name an OR.
+        assert ids(Filters=[{"Name": "volume-id", "Values": [first_vol]},
+                            {"Name": "volume-size", "Values": ["12"]}]) == []
+        assert ids(Filters=[{"Name": "volume-id", "Values": [first_vol, second_vol]}]) == sorted(
+            [tagged, spare, other_volume])
+        # A filter that matches nothing is an empty list, not "everything".
+        assert ids(Filters=[{"Name": f"tag:{key}", "Values": ["matches-nothing"]}]) == []
+        assert ids(Filters=[{"Name": "volume-size", "Values": ["4096"]}]) == []
+        # The SnapshotIds argument and the filters narrow together rather than either winning.
+        assert ids(SnapshotIds=[tagged, spare],
+                   Filters=[{"Name": f"tag:{key}", "Values": [tag]}]) == [tagged]
+    finally:
+        # Cleanup must not mask a failed assertion above.
+        for snapshot_id in (tagged, spare, other_volume):
+            try:
+                ec2.delete_snapshot(SnapshotId=snapshot_id)
+            except ClientError:
+                pass
+        for volume_id in (first_vol, second_vol):
+            try:
+                ec2.delete_volume(VolumeId=volume_id)
+            except ClientError:
+                pass
+
 def test_ebs_delete_snapshot(ec2):
     vol = ec2.create_volume(AvailabilityZone="us-east-1a", Size=10, VolumeType="gp2")
     snap = ec2.create_snapshot(VolumeId=vol["VolumeId"])
@@ -3853,6 +3905,41 @@ def test_ec2_registered_ami_boots_a_container(vm):
     assert inst["PrivateIpAddress"] == "172.30.0.9"
     assert inst["PublicIpAddress"] == "172.30.0.9"
     assert inst["PrivateDnsName"] == "ip-172-30-0-9.ec2.internal"
+
+
+def test_ec2_parse_docker_flags():
+    kwargs = ec2mod._parse_ec2_docker_flags(
+        "--privileged -e A=1 --env B=two -v /h:/c:ro --cap-add SYS_ADMIN "
+        "--tmpfs /run:rw,size=64m --add-host me:10.0.0.1 -m 512m --shm-size 128m "
+        "--init=false --bogus-flag xyz")
+    assert kwargs["privileged"] is True
+    assert kwargs["environment"] == {"A": "1", "B": "two"}
+    assert kwargs["volumes"] == ["/h:/c:ro"]
+    assert kwargs["cap_add"] == ["SYS_ADMIN"]
+    assert kwargs["tmpfs"] == {"/run": "rw,size=64m"}
+    assert kwargs["extra_hosts"] == {"me": "10.0.0.1"}
+    assert kwargs["mem_limit"] == "512m"
+    assert kwargs["shm_size"] == "128m"
+    # --init is refused, never forwarded: instance containers always run with init.
+    assert "init" not in kwargs
+    assert ec2mod._parse_ec2_docker_flags("") == {}
+    # Malformed input is ignored rather than raising or exiting inside the server:
+    # a flag missing its value trips argparse's error path, an unbalanced quote
+    # trips shlex.
+    for bad in ("-m", "--cap-add", "'unbalanced"):
+        assert ec2mod._parse_ec2_docker_flags(bad) == {}
+
+
+def test_ec2_docker_flags_reach_the_container(vm, monkeypatch):
+    fake, created = vm
+    monkeypatch.setattr(ec2mod, "EC2_DOCKER_FLAGS", "--privileged --cap-add SYS_ADMIN")
+    ami = _register("example/box:1")
+    iids, _ = _launch(ami)
+    created.extend(iids)
+    run = fake._runs[0]
+    assert run["privileged"] is True
+    assert run["cap_add"] == ["SYS_ADMIN"]
+    assert run["init"] is True
 
 
 def test_ec2_failed_boot_backs_every_record_out(monkeypatch):

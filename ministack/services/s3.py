@@ -1213,12 +1213,13 @@ def _resolve_object_checksums(body: bytes, headers: dict):
     """Build the stored checksum dict and validate any client-supplied values.
 
     AWS PutObject contract:
-      - `x-amz-checksum-{alg}` headers carry a client-computed value.
+      - `x-amz-checksum-{alg}` headers carry a client-computed value, which
+        the server recomputes from the body and MUST reject with `BadDigest`
+        (HTTP 400) when the two disagree.  A value that is never checked is
+        worse than none: it round-trips on Get as though the body had been
+        verified.
       - `x-amz-sdk-checksum-algorithm: ALG` asks the server to compute that
         algorithm; the resulting value is returned alongside the response.
-      - When the SDK both names an algorithm AND supplies its value, the
-        server-computed value MUST match the supplied one or the request is
-        rejected with `BadDigest` (HTTP 400).
 
     Ministack-specific: CRC32C requires an optional native library that the
     "no new dependencies" rule forbids us from adding. Rather than silently
@@ -1257,18 +1258,24 @@ def _resolve_object_checksums(body: bytes, headers: dict):
             400,
         )
 
+    # Every supplied value is verified against the body, whether or not the
+    # request also names an algorithm for the server to compute: the client
+    # asked for the object to be checked, and an unverified value would be
+    # stored and echoed as if it had been.
     checksums = dict(provided)
+    for alg, supplied in provided.items():
+        computed = _compute_s3_checksum(alg, body)
+        if computed is not None and supplied != computed:
+            return {}, _error(
+                "BadDigest",
+                f"The {alg} you specified did not match the calculated checksum.",
+                400,
+            )
+
     if sdk_alg_raw:
         sdk_key = sdk_alg_raw.upper().replace("_", "")
         computed = _compute_s3_checksum(sdk_alg_raw, body)
         if computed is not None:
-            existing = provided.get(sdk_key)
-            if existing and existing != computed:
-                return {}, _error(
-                    "BadDigest",
-                    f"The {sdk_key} you specified did not match the calculated checksum.",
-                    400,
-                )
             checksums[sdk_key] = computed
     return checksums, None
 
@@ -1543,6 +1550,54 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     return None
 
 
+# SigV4 / SigV2 presign machinery: query parameters that are part of the
+# signature itself, never a hoisted request header.
+_PRESIGN_SIGNING_PARAMS = {
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-content-sha256",
+}
+
+
+def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
+    """Fold a presigned URL's hoisted ``x-amz-*`` query params into headers.
+
+    A presigned URL is handed to a caller who sends nothing but the URL and a
+    body, so the ``x-amz-*`` headers the operation asked for — user metadata
+    (``x-amz-meta-*``), ACL, storage class, tagging, SSE, copy source — cannot
+    travel as headers. SigV4 allows them to be *hoisted* into the query string
+    instead, where the signature covers them exactly as a signed header would,
+    and several SDKs presign that way (some hoist every ``x-amz-`` header, some
+    only what the operation set). Real S3 applies those params as the headers
+    they stand for.
+
+    MiniStack only ever looked at headers, so a presigned upload carrying
+    metadata in its query string stored the object without any: the PUT
+    succeeded and the metadata was silently dropped.
+
+    An explicitly sent header always wins over its hoisted twin.
+    """
+    hoisted = None
+    for name, values in query_params.items():
+        lname = name.lower()
+        if not lname.startswith("x-amz-") or lname in _PRESIGN_SIGNING_PARAMS:
+            continue
+        if lname in headers:
+            continue
+        value = values[0] if isinstance(values, list) else values
+        if value is None:
+            continue
+        if hoisted is None:
+            hoisted = dict(headers)
+        hoisted[lname] = value
+    return hoisted if hoisted is not None else headers
+
+
 async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict,
     signed_path: str | None = None,
@@ -1561,6 +1616,11 @@ async def handle_request(
         resp_headers.setdefault("x-amz-request-id", new_uuid())
         resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
         return status, resp_headers, resp_body
+
+    # A presigned URL may carry its `x-amz-*` headers in the query string; fold
+    # them back in before routing so metadata, ACL, storage class and friends
+    # reach the handlers exactly as a header-signed request delivers them.
+    headers = _merge_hoisted_amz_headers(headers, query_params)
 
     result = _dispatch(method, bucket, key, headers, body, query_params)
 
@@ -4289,6 +4349,44 @@ def _object_mtime_dt(obj: dict):
     return dt.replace(microsecond=0)
 
 
+def _check_copy_source_preconditions(headers: dict, src_obj: dict):
+    """Judge the x-amz-copy-source-if-* headers against the source.
+
+    Per the AWS CopyObject reference (RFC 7232 precedence):
+    x-amz-copy-source-if-match takes precedence over -if-unmodified-since,
+    and -if-none-match over -if-modified-since, so the date header only
+    applies when its ETag counterpart is absent.  UploadPartCopy carries the
+    same four headers and judges them the same way, so both ask here.
+
+    Returns an error response, or None when every condition holds."""
+    msg = "At least one of the pre-conditions you specified did not hold"
+    src_mtime = _object_mtime_dt(src_obj)
+    src_etag = (src_obj.get("etag") or "").strip('"')
+
+    if_match = headers.get("x-amz-copy-source-if-match", "")
+    if if_match:
+        if if_match.strip('"') != src_etag:
+            return _error("PreconditionFailed", msg, 412)
+    else:
+        unmod = _parse_http_date(
+            headers.get("x-amz-copy-source-if-unmodified-since", ""))
+        # "Unmodified since" fails when the source was modified after it.
+        if unmod and src_mtime and src_mtime > unmod:
+            return _error("PreconditionFailed", msg, 412)
+
+    if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
+    if if_none_match:
+        if if_none_match.strip('"') == src_etag:
+            return _error("PreconditionFailed", msg, 412)
+    else:
+        mod = _parse_http_date(
+            headers.get("x-amz-copy-source-if-modified-since", ""))
+        # "Modified since" fails when the source has NOT changed since it.
+        if mod and src_mtime and src_mtime <= mod:
+            return _error("PreconditionFailed", msg, 412)
+    return None
+
+
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # Split the raw header at "?" before percent-decoding: a key legitimately
     # containing "?versionId" arrives encoded (%3FversionId) and must stay
@@ -4320,6 +4418,13 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
+
+    # A canned ACL on the copy applies to the destination, as it does on a
+    # put; an unknown value rejects the whole request rather than being
+    # dropped on the floor.
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
     if src_version_id:
         ventry = next(
@@ -4367,32 +4472,9 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # AWS echoes the copied source version on a versioned source.
     copy_src_vid = src_version_id or src_obj.get("version_id")
 
-    # Copy-source preconditions. Per the AWS CopyObject reference (RFC 7232
-    # precedence): x-amz-copy-source-if-match takes precedence over
-    # -if-unmodified-since, and -if-none-match over -if-modified-since, so the
-    # date header only applies when its ETag counterpart is absent.
-    _precond_msg = "At least one of the pre-conditions you specified did not hold"
-    src_mtime = _object_mtime_dt(src_obj)
-
-    if_match = headers.get("x-amz-copy-source-if-match", "")
-    if if_match:
-        if if_match.strip('"') != src_obj["etag"].strip('"'):
-            return _error("PreconditionFailed", _precond_msg, 412)
-    else:
-        unmod = _parse_http_date(headers.get("x-amz-copy-source-if-unmodified-since", ""))
-        # "Unmodified since" fails when the source was modified after the given time.
-        if unmod and src_mtime and src_mtime > unmod:
-            return _error("PreconditionFailed", _precond_msg, 412)
-
-    if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
-    if if_none_match:
-        if if_none_match.strip('"') == src_obj["etag"].strip('"'):
-            return _error("PreconditionFailed", _precond_msg, 412)
-    else:
-        mod = _parse_http_date(headers.get("x-amz-copy-source-if-modified-since", ""))
-        # "Modified since" fails when the source has NOT changed since the given time.
-        if mod and src_mtime and src_mtime <= mod:
-            return _error("PreconditionFailed", _precond_msg, 412)
+    precond_err = _check_copy_source_preconditions(headers, src_obj)
+    if precond_err is not None:
+        return precond_err
 
     directive = headers.get("x-amz-metadata-directive", "COPY").upper()
     if directive == "REPLACE":
@@ -4517,6 +4599,14 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
     else:
         _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
+
+    if canned_acl:
+        _object_acl[(bucket_name, dest_key, dest_version_id)] = (
+            _canned_acl_policy_xml(canned_acl, _canonical_owner_id()))
+    else:
+        # The destination is a new object: it does not inherit whatever the
+        # key it replaced was permissioned with.
+        _object_acl.pop((bucket_name, dest_key, dest_version_id), None)
 
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
@@ -5694,6 +5784,10 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     sse_src_err = _check_sse_c_copy_source(headers, ventry)
     if sse_src_err is not None:
         return sse_src_err
+
+    precond_err = _check_copy_source_preconditions(headers, ventry)
+    if precond_err is not None:
+        return precond_err
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")

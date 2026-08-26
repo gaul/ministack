@@ -2895,6 +2895,133 @@ def test_eventbridge_input_transformer_ingestion_time(eb, sqs):
 
 
 # ---------------------------------------------------------------------------
+# Input template quoting
+# ---------------------------------------------------------------------------
+
+def _transform_to_queue(eb, sqs, slug, source, template, paths_map, detail):
+    """Route one event through an input transformer and return the delivered body."""
+    bus_name = f"qa-eb-{slug}-bus"
+    eb.create_event_bus(Name=bus_name)
+    q_url = sqs.create_queue(QueueName=f"qa-eb-{slug}-q")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(
+        Name=f"qa-eb-{slug}-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"source": [source]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule=f"qa-eb-{slug}-rule",
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "t1",
+                "Arn": q_arn,
+                "InputTransformer": {"InputPathsMap": paths_map, "InputTemplate": template},
+            }
+        ],
+    )
+    eb.put_events(
+        Entries=[
+            {
+                "Source": source,
+                "DetailType": "TestEvent",
+                "Detail": json.dumps(detail),
+                "EventBusName": bus_name,
+            }
+        ]
+    )
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    return msgs["Messages"][0]["Body"]
+
+
+def test_eventbridge_input_template_quotes_unquoted_string_variable(eb, sqs):
+    """Quotes around a string variable are optional; AWS adds them in a value position."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-unquoted-str",
+        "myapp.tmpl.unquoted",
+        '{"widgetId": <widgetId>, "state": <state>}',
+        {"widgetId": "$.detail.widgetId", "state": "$.detail.state"},
+        {"widgetId": "widget-1", "state": "READY"},
+    )
+    assert json.loads(body) == {"widgetId": "widget-1", "state": "READY"}
+
+
+def test_eventbridge_input_template_mixes_unquoted_object_and_string(eb, sqs):
+    """An unquoted object variable stays raw JSON while a string variable gains quotes."""
+    detail = {"widgetId": "widget-2", "quantity": 3}
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-mixed",
+        "myapp.tmpl.mixed",
+        '{"detail": <detail>, "groupId": <groupId>}',
+        {"groupId": "$.detail.widgetId", "detail": "$.detail"},
+        detail,
+    )
+    assert json.loads(body) == {"detail": detail, "groupId": "widget-2"}
+
+
+def test_eventbridge_input_template_quoted_string_variable_unchanged(eb, sqs):
+    """Explicitly quoting a string variable still yields a single set of quotes."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-quoted-str",
+        "myapp.tmpl.quoted",
+        '{"groupId": "<groupId>"}',
+        {"groupId": "$.detail.widgetId"},
+        {"widgetId": "widget-3"},
+    )
+    assert json.loads(body) == {"groupId": "widget-3"}
+
+
+def test_eventbridge_input_template_variable_inside_string_literal(eb, sqs):
+    """A variable embedded in surrounding text is interpolated without added quotes."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-inline",
+        "myapp.tmpl.inline",
+        '{"message": "widget <widgetId> is <state>", "state": <state>}',
+        {"widgetId": "$.detail.widgetId", "state": "$.detail.state"},
+        {"widgetId": "widget-4", "state": "READY"},
+    )
+    assert json.loads(body) == {"message": "widget widget-4 is READY", "state": "READY"}
+
+
+def test_eventbridge_input_template_plain_text(eb, sqs):
+    """A template with no JSON quoting is delivered as plain interpolated text."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-plain",
+        "myapp.tmpl.plain",
+        "widget <widgetId> is <state>",
+        {"widgetId": "$.detail.widgetId", "state": "$.detail.state"},
+        {"widgetId": "widget-5", "state": "READY"},
+    )
+    assert body == "widget widget-5 is READY"
+
+
+def test_eventbridge_input_template_object_inside_string_literal(eb, sqs):
+    """An object variable used inside a string has its quotes stripped, as AWS does."""
+    body = _transform_to_queue(
+        eb,
+        sqs,
+        "tmpl-obj-in-str",
+        "myapp.tmpl.objinstr",
+        '{"message": "detail is <detail>"}',
+        {"detail": "$.detail"},
+        {"widgetId": "widget-6"},
+    )
+    assert json.loads(body) == {"message": "detail is {widgetId: widget-6}"}
+
+
+# ---------------------------------------------------------------------------
 # API destination dispatch
 # ---------------------------------------------------------------------------
 
@@ -5211,14 +5338,14 @@ def test_eventbridge_unmodelled_top_level_key_is_matchable_not_dropped(eb):
     assert _matches_event(eb, dict(carried, Source="evil"), {"source": ["v.test"]}) is True
 
 
-def test_eventbridge_dotted_pattern_key_is_a_distinct_segment(eb):
-    """A deliberate divergence: AWS resolves ``{"a.b": [...]}`` to the same path as
-    the nested spelling, where a key holding a dot stays one segment here. Pinned
-    so the CHANGELOG's divergence list is self-checking rather than asserted."""
+def test_eventbridge_dotted_pattern_key_resolves_as_nested_path(eb):
+    """Event Ruler joins keys with ".", so the dotted and nested spellings are one
+    sub-rule. The residual divergence stays pinned: an event FIELD literally named
+    "a.b" flattens to the same path on AWS, where it stays one key here."""
     dotted = {"a.b": ["v"]}
-    assert _pattern_matches(eb, dotted, {"a": {"b": "v"}}) is False
-    assert _pattern_matches(eb, dotted, {"a.b": "v"}) is True
+    assert _pattern_matches(eb, dotted, {"a": {"b": "v"}}) is True
     assert _pattern_matches(eb, {"a": {"b": ["v"]}}, {"a": {"b": "v"}}) is True
+    assert _pattern_matches(eb, dotted, {"a.b": "v"}) is False  # AWS: True
 
 
 def test_eventbridge_pattern_nesting_bound_clears_real_patterns(eb):
@@ -5413,3 +5540,82 @@ def test_eventbridge_case_insensitive_suffix_does_not_scan_quadratically():
     assert _eb._matches_content_filter(
         value, {"suffix": {"equals-ignore-case": ".PNG"}}) is True
     assert time.monotonic() - started < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Dotted pattern keys — a dotted key and the nested form are the same sub-rule.
+# ---------------------------------------------------------------------------
+
+def test_eventbridge_dotted_key_matches_nested_field(eb):
+    assert _matches_event(
+        eb,
+        {"source": "dot.test", "detail-type": "T", "detail": {"name": "user.created"}},
+        {"detail.name": ["user.created"]}) is True
+    assert _matches_event(
+        eb,
+        {"source": "dot.test", "detail-type": "T", "detail": {"name": "other"}},
+        {"detail.name": ["user.created"]}) is False
+
+
+def test_eventbridge_dotted_key_equals_nested_form(eb):
+    event = {"source": "dot.test", "detail-type": "T",
+             "detail": {"state": {"status": "running"}}}
+    assert _matches_event(eb, event, {"detail.state.status": ["running"]}) is True
+    assert _matches_event(eb, event, {"detail": {"state.status": ["running"]}}) is True
+    assert _matches_event(eb, event, {"detail": {"state": {"status": ["running"]}}}) is True
+
+
+def test_eventbridge_dotted_key_with_object_value(eb):
+    event = {"source": "dot.test", "detail-type": "T",
+             "detail": {"state": {"status": "running"}}}
+    assert _matches_event(eb, event, {"detail.state": {"status": ["running"]}}) is True
+    assert _matches_event(eb, event, {"detail.state": {"status": ["stopped"]}}) is False
+
+
+def test_eventbridge_dotted_key_operators(eb):
+    event = {"source": "dot.test", "detail-type": "T", "detail": {"name": "order.paid"}}
+    assert _matches_event(eb, event, {"detail.name": [{"prefix": "order."}]}) is True
+    assert _matches_event(eb, event, {"detail.name": [{"exists": True}]}) is True
+    assert _matches_event(eb, event, {"detail.other": [{"exists": False}]}) is True
+
+
+def test_eventbridge_dotted_key_inside_or(eb):
+    event = {"source": "dot.test", "detail-type": "T", "detail": {"name": "a"}}
+    pattern = {"$or": [{"detail.name": ["a"]}, {"detail.name": ["b"]}]}
+    assert _matches_event(eb, event, pattern) is True
+    assert _matches_event(
+        eb, {"source": "dot.test", "detail-type": "T", "detail": {"name": "c"}},
+        pattern) is False
+
+
+def test_eventbridge_dotted_key_leaf_collision_is_last_write_wins(eb):
+    """Both spellings write the same leaf, so document order decides."""
+    event = {"source": "dot.test", "detail-type": "T", "detail": {"name": "b"}}
+    assert _matches_event(
+        eb, event, {"detail.name": ["a"], "detail": {"name": ["b"]}}) is True
+    assert _matches_event(
+        eb, event, {"detail": {"name": ["b"]}, "detail.name": ["a"]}) is False
+
+
+def test_eventbridge_dotted_key_rule_delivers_to_sqs(eb, sqs):
+    queue_name = f"dotted-key-{_uuid_mod.uuid4().hex[:8]}"
+    rule_name = f"dotted-key-{_uuid_mod.uuid4().hex[:8]}"
+    q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    eb.put_rule(Name=rule_name,
+                EventPattern=json.dumps({"detail.name": ["dotted.ping"]}),
+                State="ENABLED")
+    eb.put_targets(Rule=rule_name, Targets=[{"Id": "1", "Arn": queue_arn}])
+
+    eb.put_events(Entries=[{
+        "Source": "dot.test",
+        "DetailType": "T",
+        "Detail": json.dumps({"name": "dotted.ping", "payload": {"ok": True}}),
+        "EventBusName": "default",
+    }])
+
+    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["detail"]["name"] == "dotted.ping"

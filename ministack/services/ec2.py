@@ -87,6 +87,9 @@ logger = logging.getLogger("ec2")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+# docker-CLI-style flags applied to every instance container (e.g. --privileged
+# for a systemd guest). Parsed by _parse_ec2_docker_flags; --init is refused.
+EC2_DOCKER_FLAGS = os.environ.get("EC2_DOCKER_FLAGS", "")
 
 # Docker client, created on first use. Only registered images reach for it, so
 # an emulator nobody registered an AMI with never imports docker-py at all.
@@ -2111,6 +2114,75 @@ def _image_has_entrypoint(client, ref):
     return bool((image.attrs.get("Config") or {}).get("Entrypoint"))
 
 
+def _parse_ec2_docker_flags(flags: str) -> dict:
+    """Translate a docker-CLI-style ``EC2_DOCKER_FLAGS`` string into docker-py
+    ``containers.run()`` kwargs (subset; unknown flags are ignored, malformed
+    input is warned about and ignored rather than failing the launch).
+    ``--init`` is refused: init reaps whatever PID 1 leaves behind, and an image
+    with no ENTRYPOINT relies on it to reap the appended keepalive command —
+    disabling it silently breaks the box. Same approach as
+    ``_parse_docker_flags`` (``LAMBDA_DOCKER_FLAGS``) in ``lambda_svc.py``,
+    kept service-local like everything else in this file."""
+    if not flags:
+        return {}
+    import argparse
+    import shlex
+
+    try:
+        tokens = shlex.split(flags)
+    except ValueError as e:
+        logger.warning("EC2: could not parse EC2_DOCKER_FLAGS %r: %s", flags, e)
+        return {}
+    kept = []
+    for tok in tokens:
+        if tok == "--init" or tok.startswith("--init="):
+            logger.warning("EC2: ignoring %s in EC2_DOCKER_FLAGS — "
+                           "instance containers always run with init", tok)
+            continue
+        kept.append(tok)
+
+    class _QuietParser(argparse.ArgumentParser):
+        # argparse's default error() prints usage and calls sys.exit(), which
+        # must never happen inside the server — raise instead and warn below.
+        def error(self, message):
+            raise ValueError(message)
+
+    parser = _QuietParser(add_help=False)
+    parser.add_argument("-e", "--env", action="append", default=[])
+    parser.add_argument("-v", "--volume", action="append", default=[])
+    parser.add_argument("--cap-add", action="append", default=[])
+    parser.add_argument("--tmpfs", action="append", default=[])
+    parser.add_argument("--add-host", action="append", default=[])
+    parser.add_argument("-m", "--memory")
+    parser.add_argument("--shm-size")
+    parser.add_argument("--privileged", action="store_true")
+    try:
+        args, unknown = parser.parse_known_args(kept)
+    except ValueError as e:
+        logger.warning("EC2: could not parse EC2_DOCKER_FLAGS %r: %s", flags, e)
+        return {}
+    if unknown:
+        logger.debug("EC2: ignoring unsupported EC2_DOCKER_FLAGS tokens: %s", unknown)
+    kwargs = {}
+    if args.privileged:
+        kwargs["privileged"] = True
+    if args.env:
+        kwargs["environment"] = dict(e.partition("=")[::2] for e in args.env)
+    if args.volume:
+        kwargs["volumes"] = args.volume
+    if args.cap_add:
+        kwargs["cap_add"] = args.cap_add
+    if args.tmpfs:
+        kwargs["tmpfs"] = {path: opts for path, _, opts in (t.partition(":") for t in args.tmpfs)}
+    if args.add_host:
+        kwargs["extra_hosts"] = {h: ip for h, _, ip in (a.partition(":") for a in args.add_host)}
+    if args.memory:
+        kwargs["mem_limit"] = args.memory
+    if args.shm_size:
+        kwargs["shm_size"] = args.shm_size
+    return kwargs
+
+
 def _vm_launch(inst, image_ref):
     """Boot one instance record as a container. Raises on create/start failure;
     the caller backs the records out and surfaces the error."""
@@ -2144,6 +2216,7 @@ def _vm_launch(inst, image_ref):
         kwargs["command"] = ["sleep", "infinity"]
     if network:
         kwargs["network"] = network
+    kwargs.update(_parse_ec2_docker_flags(EC2_DOCKER_FLAGS))
     container = client.containers.run(ref, **kwargs)
     global _docker_in_use
     _docker_in_use = True
@@ -3727,9 +3800,30 @@ def _delete_snapshot(p):
     return _xml(200, "DeleteSnapshotResponse", "<return>true</return>")
 
 
+def _snapshot_matches_filters(snap, filters):
+    """Apply the DescribeSnapshots filters, except the tag ones the shared helper handles."""
+    scalars = {
+        "snapshot-id": snap["SnapshotId"],
+        "volume-id": snap["VolumeId"],
+        "volume-size": str(snap["VolumeSize"]),
+        "status": snap["State"],
+        "start-time": snap["StartTime"],
+        "progress": snap["Progress"],
+        "owner-id": snap["OwnerId"],
+        "description": snap["Description"],
+        "storage-tier": snap["StorageTier"],
+        "encrypted": "true" if snap.get("Encrypted") else "false",
+    }
+    for name, value in scalars.items():
+        if filters.get(name) and value not in filters[name]:
+            return False
+    return True
+
+
 def _describe_snapshots(p):
     filter_ids = _parse_member_list(p, "SnapshotId")
     owner_ids = _parse_member_list(p, "Owner")
+    filters = _parse_filters(p)
     if filter_ids:
         for sid in filter_ids:
             if sid not in _snapshots:
@@ -3739,6 +3833,10 @@ def _describe_snapshots(p):
         if filter_ids and snap["SnapshotId"] not in filter_ids:
             continue
         if owner_ids and snap["OwnerId"] not in owner_ids and "self" not in owner_ids:
+            continue
+        if not _resource_matches_tag_filters(snap["SnapshotId"], filters):
+            continue
+        if not _snapshot_matches_filters(snap, filters):
             continue
         items += f"<item>{_snapshot_inner_xml(snap)}</item>"
     return _xml(200, "DescribeSnapshotsResponse", f"<snapshotSet>{items}</snapshotSet>")
